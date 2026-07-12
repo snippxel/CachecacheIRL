@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#0A0D12" />
+<title>Traque — Cache-cache IRL</title>
+<link rel="manifest" href="manifest.json" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ===== ECRAN ACCUEIL ===== -->
+<section id="screen-home" class="screen active">
+  <div class="radar-mark"><div class="radar-sweep"></div><div class="radar-dot"></div></div>
+  <h1 class="brand">TRAQUE</h1>
+  <p class="tagline">Le cache-cache passe en mode signal.</p>
+
+  <div class="card">
+    <label class="field-label">Ton nom</label>
+    <input id="input-name" class="input" type="text" placeholder="Ton pseudo" maxlength="16" />
+  </div>
+
+  <button id="btn-create" class="btn btn-primary">Créer une partie</button>
+
+  <div class="divider"><span>ou</span></div>
+
+  <div class="card">
+    <label class="field-label">Code de partie</label>
+    <input id="input-code" class="input input-code" type="text" placeholder="AB3XZ" maxlength="5" />
+  </div>
+  <button id="btn-join" class="btn btn-outline">Rejoindre</button>
+
+  <p id="home-error" class="error-text"></p>
+</section>
+
+<!-- ===== ECRAN LOBBY ===== -->
+<section id="screen-lobby" class="screen">
+  <header class="topbar">
+    <span class="eyebrow">Salle</span>
+    <span id="lobby-code" class="room-code">------</span>
+  </header>
+
+  <p class="section-label">Signaux connectés</p>
+  <ul id="lobby-players" class="player-list"></ul>
+
+  <!-- Visible uniquement pour l'hôte -->
+  <div id="host-controls" class="host-controls hidden">
+    <p class="section-label">Répartition des rôles</p>
+    <div class="role-btn-row">
+      <button id="btn-random-roles" class="btn btn-outline btn-sm">Aléatoire</button>
+      <button id="btn-manual-roles" class="btn btn-outline btn-sm">Manuel</button>
+    </div>
+    <div id="manual-roles-panel" class="hidden"></div>
+
+    <p class="section-label">Zone de jeu</p>
+    <div class="zone-config">
+      <label>Rayon de départ (m) <input id="cfg-radius-start" type="number" value="400" class="input input-sm"/></label>
+      <label>Rayon final (m) <input id="cfg-radius-end" type="number" value="40" class="input input-sm"/></label>
+      <label>Durée (minutes) <input id="cfg-duration" type="number" value="20" class="input input-sm"/></label>
+    </div>
+    <button id="btn-start-game" class="btn btn-primary">Lancer la partie</button>
+  </div>
+
+  <!-- Visible uniquement pour les non-hôtes : aucune action possible, juste l'attente -->
+  <div id="guest-waiting" class="guest-waiting hidden">
+    <div class="pulse-dot"></div>
+    <p class="waiting-text">En attente que l'hôte lance la partie…</p>
+  </div>
+</section>
+
+<!-- ===== ECRAN JEU ===== -->
+<section id="screen-game" class="screen">
+  <div id="map"></div>
+
+  <div class="hud-top">
+    <div id="role-badge" class="role-badge">—</div>
+    <div class="hud-top-right">
+      <div id="timer" class="timer">--:--</div>
+      <div id="reveal-timer" class="reveal-timer hidden">Signal caché dans <span id="reveal-countdown">--:--</span></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <div class="hud-bottom">
+    <!-- Bouton "Mon code" : uniquement pour les joueurs CACHÉS, ça ne sert à rien pour un chasseur -->
+    <button id="btn-my-qr" class="fab fab-secondary hidden">Mon code</button>
+    <!-- Bouton "Éliminer" : uniquement pour les CHASSEURS -->
+    <button id="btn-scan" class="fab fab-primary hidden">Éliminer</button>
+  </div>
+</section>
+
+<!-- ===== ECRAN FIN ===== -->
+<section id="screen-over" class="screen">
+  <div class="card center-card">
+    <h2 id="over-title" class="over-title">Partie terminée</h2>
+    <p id="over-reason" class="over-reason"></p>
+    <button id="btn-back-home" class="btn btn-primary">Retour à l'accueil</button>
+  </div>
+</section>
+
+<!-- ===== MODALE QR PERSONNEL (cachés uniquement) ===== -->
+<div id="modal-qr" class="modal hidden">
+  <div class="modal-card">
+    <p class="section-label">Montre ce code au chasseur</p>
+    <div id="qr-canvas-wrap"></div>
+    <button class="btn btn-outline btn-sm modal-close" data-close="modal-qr">Fermer</button>
+  </div>
+</div>
+
+<!-- ===== MODALE SCAN (chasseurs uniquement) ===== -->
+<div id="modal-scan" class="modal hidden">
+  <div class="modal-card">
+    <p class="section-label">Scanne le code de ta cible</p>
+    <div id="qr-reader"></div>
+    <button class="btn btn-outline btn-sm modal-close" data-close="modal-scan">Annuler</button>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="/socket.io/socket.io.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
