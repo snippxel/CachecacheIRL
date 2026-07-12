@@ -24,6 +24,7 @@ let state = {
   map: null,
   markers: {},
   zoneCircle: null,
+  myMarker: null,
   timerInterval: null,
   nextRevealAt: null
 };
@@ -253,24 +254,21 @@ function updateZoneRadius() {
   state.zoneCircle.setRadius(currentZoneRadius());
 }
 
-// N'affiche un marqueur QUE si le joueur a une position transmise par le
-// serveur (lat/lng non nuls). Un caché non "révélé" n'a simplement pas de
-// position ici : rien à afficher, pas de triche possible côté client.
 function renderGamePlayers() {
   if (!state.map) return;
   const activeIds = new Set();
   state.players.forEach(p => {
+    if (p.id === state.playerId) return;
     if (p.lat == null || p.lng == null) return;
     activeIds.add(p.id);
-    const isMe = p.id === state.playerId;
-    const color = isMe ? '#FF9F1C' : (p.role === 'hunter' ? '#E63946' : '#2EC4B6');
+    const color = p.role === 'hunter' ? '#E63946' : '#2EC4B6';
     const stale = !p.live ? ' stale' : '';
     if (state.markers[p.id]) {
       state.markers[p.id].setLatLng([p.lat, p.lng]);
     } else {
       const icon = L.divIcon({
         className: '',
-        html: `<div class="player-marker${isMe ? ' me' : ''}${stale}" style="background:${color}"></div>
+        html: `<div class="player-marker${stale}" style="background:${color}"></div>
                <div class="marker-label">${escapeHtml(p.name)}${!p.live ? ' (signal)' : ''}</div>`,
         iconSize: [18, 18], iconAnchor: [9, 9]
       });
@@ -282,7 +280,6 @@ function renderGamePlayers() {
   });
 }
 
-// Distance approximative en metres (suffisant pour de petits deltas locaux)
 function roughDistanceMeters(lat1, lng1, lat2, lng2) {
   const R = 6371000;
   const toRad = (d) => (d * Math.PI) / 180;
@@ -292,9 +289,9 @@ function roughDistanceMeters(lat1, lng1, lat2, lng2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-const MAX_ACCEPTABLE_ACCURACY_M = 30; // au-dela, la mesure GPS est jugee trop bruitee
-const MIN_SEND_INTERVAL_MS = 1500; // n'envoie pas plus souvent que ca, meme si ca bouge
-const MIN_MOVE_METERS = 2; // ...sauf si on a vraiment bouge de plus de 2m
+const MAX_ACCEPTABLE_ACCURACY_M = 30;
+const MIN_SEND_INTERVAL_MS = 1500;
+const MIN_MOVE_METERS = 2;
 
 function startGeolocation() {
   if (state.watchId) navigator.geolocation.clearWatch(state.watchId);
@@ -304,7 +301,9 @@ function startGeolocation() {
   state.watchId = navigator.geolocation.watchPosition((pos) => {
     const { latitude, longitude, accuracy } = pos.coords;
 
-    // on ignore les mesures GPS trop imprecises (rebonds sur immeubles, etc.)
+    renderMyOwnMarker(latitude, longitude);
+    updateMyMarkerAccuracy(latitude, longitude, accuracy);
+
     if (accuracy != null && accuracy > MAX_ACCEPTABLE_ACCURACY_M) {
       updateAccuracyBadge(accuracy, true);
       return;
@@ -316,9 +315,22 @@ function startGeolocation() {
     if (now - lastSentAt < MIN_SEND_INTERVAL_MS && !moved) return;
 
     lastSentAt = now; lastLat = latitude; lastLng = longitude;
-    updateMyMarkerAccuracy(latitude, longitude, accuracy);
     socket.emit('update_position', { code: state.code, lat: latitude, lng: longitude, accuracy });
   }, (err) => console.warn('Géoloc erreur', err), { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 });
+}
+
+function renderMyOwnMarker(lat, lng) {
+  if (!state.map) return;
+  const icon = L.divIcon({
+    className: '',
+    html: `<div class="player-marker me" style="background:#FF9F1C"></div><div class="marker-label">Toi</div>`,
+    iconSize: [18, 18], iconAnchor: [9, 9]
+  });
+  if (state.myMarker) {
+    state.myMarker.setLatLng([lat, lng]);
+  } else {
+    state.myMarker = L.marker([lat, lng], { icon, zIndexOffset: 1000 }).addTo(state.map);
+  }
 }
 
 function updateAccuracyBadge(accuracy, rejected) {
@@ -360,7 +372,6 @@ function startTimer() {
   }, 1000);
 }
 
-// ---------- QR : mon code (cachés uniquement, bouton masqué sinon) ----------
 document.getElementById('btn-my-qr').addEventListener('click', () => {
   if (!state.myToken) return;
   const wrap = document.getElementById('qr-canvas-wrap');
@@ -369,7 +380,6 @@ document.getElementById('btn-my-qr').addEventListener('click', () => {
   document.getElementById('modal-qr').classList.remove('hidden');
 });
 
-// ---------- QR : scanner (chasseurs uniquement, bouton masqué sinon) ----------
 let html5QrCode = null;
 
 document.getElementById('btn-scan').addEventListener('click', () => {
@@ -406,7 +416,6 @@ function showToast(msg) {
   showToast._t = setTimeout(() => toast.classList.add('hidden'), 2600);
 }
 
-// ---------- Fin de partie ----------
 socket.on('game_over', ({ winner, reason }) => {
   if (state.watchId) navigator.geolocation.clearWatch(state.watchId);
   if (state.timerInterval) clearInterval(state.timerInterval);
@@ -420,7 +429,6 @@ document.getElementById('btn-back-home').addEventListener('click', () => {
   location.reload();
 });
 
-// ---------- Utils ----------
 function escapeHtml(str) {
   return str.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
