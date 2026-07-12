@@ -184,7 +184,7 @@ function updateRoleUI() {
   document.getElementById('btn-my-qr').classList.toggle('hidden', state.myRole !== 'hidden');
   document.getElementById('btn-scan').classList.toggle('hidden', state.myRole !== 'hunter');
 
-  document.getElementById('reveal-timer').classList.toggle('hidden', state.myRole !== 'hunter');
+  document.getElementById('reveal-timer').classList.remove('hidden');
 }
 
 function enterGame() {
@@ -253,11 +253,63 @@ function renderGamePlayers() {
   });
 }
 
+// Distance approximative en metres (suffisant pour de petits deltas locaux)
+function roughDistanceMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+const MAX_ACCEPTABLE_ACCURACY_M = 30; // au-dela, la mesure GPS est jugee trop bruitee
+const MIN_SEND_INTERVAL_MS = 2000; // n'envoie pas plus souvent que ca, meme si ca bouge
+const MIN_MOVE_METERS = 3; // ...sauf si on a vraiment bouge de plus de 3m
+
 function startGeolocation() {
   if (state.watchId) navigator.geolocation.clearWatch(state.watchId);
+  let lastSentAt = 0;
+  let lastLat = null, lastLng = null;
+
   state.watchId = navigator.geolocation.watchPosition((pos) => {
-    socket.emit('update_position', { code: state.code, lat: pos.coords.latitude, lng: pos.coords.longitude });
-  }, (err) => console.warn('Géoloc erreur', err), { enableHighAccuracy: true, maximumAge: 2000, timeout: 10000 });
+    const { latitude, longitude, accuracy } = pos.coords;
+
+    // on ignore les mesures GPS trop imprecises (rebonds sur immeubles, etc.)
+    if (accuracy != null && accuracy > MAX_ACCEPTABLE_ACCURACY_M) {
+      updateAccuracyBadge(accuracy, true);
+      return;
+    }
+    updateAccuracyBadge(accuracy, false);
+
+    const now = Date.now();
+    const moved = lastLat == null || roughDistanceMeters(lastLat, lastLng, latitude, longitude) > MIN_MOVE_METERS;
+    if (now - lastSentAt < MIN_SEND_INTERVAL_MS && !moved) return;
+
+    lastSentAt = now; lastLat = latitude; lastLng = longitude;
+    updateMyMarkerAccuracy(latitude, longitude, accuracy);
+    socket.emit('update_position', { code: state.code, lat: latitude, lng: longitude, accuracy });
+  }, (err) => console.warn('Géoloc erreur', err), { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 });
+}
+
+function updateAccuracyBadge(accuracy, rejected) {
+  const el = document.getElementById('accuracy-badge');
+  if (!el) return;
+  el.classList.remove('hidden');
+  const val = accuracy ? Math.round(accuracy) : '?';
+  el.textContent = rejected ? `Signal GPS faible (±${val}m, ignoré)` : `Précision GPS ≈ ${val}m`;
+  el.classList.toggle('accuracy-bad', rejected);
+}
+
+let myAccuracyCircle = null;
+function updateMyMarkerAccuracy(lat, lng, accuracy) {
+  if (!state.map || accuracy == null) return;
+  if (!myAccuracyCircle) {
+    myAccuracyCircle = L.circle([lat, lng], { radius: accuracy, color: '#FF9F1C', weight: 1, fillOpacity: 0.08, dashArray: '3 5' }).addTo(state.map);
+  } else {
+    myAccuracyCircle.setLatLng([lat, lng]);
+    myAccuracyCircle.setRadius(accuracy);
+  }
 }
 
 function startTimer() {
