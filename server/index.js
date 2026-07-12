@@ -29,6 +29,12 @@ function makeToken() {
   return crypto.randomBytes(8).toString('hex');
 }
 
+function makeSessionId() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+const DISCONNECT_GRACE_MS = 90 * 1000; // temps laisse a un joueur pour revenir apres un refresh/coupure
+
 // Vue "lobby" : liste simple, pas de position
 function lobbySnapshot(room, code) {
   return {
@@ -51,19 +57,19 @@ function gameViewFor(room, code, viewerId) {
       // on se voit soi-meme en temps reel + on recoit son propre token pour afficher son QR
       return { ...base, lat: p.lat, lng: p.lng, accuracy: p.accuracy, live: true, myToken: p.token };
     }
-    if (!isHunter) {
-      // un cache ne voit JAMAIS personne d'autre : ni les chasseurs, ni les autres caches
+    if (p.role === 'hunter') {
+      // un chasseur n'est JAMAIS visible pour un cache. Seuls les autres chasseurs le voient.
+      if (isHunter) return { ...base, lat: p.lat, lng: p.lng, live: true };
       return { ...base, lat: null, lng: null, live: false };
     }
-    if (p.role === 'hunter') {
-      // les coequipiers chasseurs se voient entre eux en temps reel
-      return { ...base, lat: p.lat, lng: p.lng, live: true };
+    // p est cache (et n'est pas le viewer)
+    if (isHunter) {
+      // un chasseur ne voit la position d'un cache que via la derniere revelation (5 min)
+      if (p.lastReveal) return { ...base, lat: p.lastReveal.lat, lng: p.lastReveal.lng, live: false, revealedAt: p.lastReveal.time };
+      return { ...base, lat: null, lng: null, live: false };
     }
-    if (p.lastReveal) {
-      // cache : uniquement visible pour les chasseurs, via la derniere revelation (5 min)
-      return { ...base, lat: p.lastReveal.lat, lng: p.lastReveal.lng, live: false, revealedAt: p.lastReveal.time };
-    }
-    return { ...base, lat: null, lng: null, live: false };
+    // les caches se voient entre eux en temps reel (utile pour se regrouper / s'eviter)
+    return { ...base, lat: p.lat, lng: p.lng, live: true };
   });
 
   return {
@@ -104,6 +110,7 @@ io.on('connection', (socket) => {
 
   socket.on('create_room', ({ name }, cb) => {
     const code = makeCode();
+    const sessionId = makeSessionId();
     rooms[code] = {
       hostId: socket.id,
       status: 'lobby',
@@ -113,13 +120,13 @@ io.on('connection', (socket) => {
       dirty: false,
       nextRevealAt: null,
       players: {
-        [socket.id]: { id: socket.id, name: name || 'Hôte', role: null, lat: null, lng: null, lastReveal: null, token: makeToken(), lastUpdate: null }
+        [socket.id]: { id: socket.id, name: name || 'Hôte', role: null, lat: null, lng: null, lastReveal: null, token: makeToken(), sessionId, connected: true, disconnectTimer: null, lastUpdate: null }
       },
       createdAt: Date.now()
     };
     currentCode = code;
     socket.join(code);
-    cb({ ok: true, code, playerId: socket.id });
+    cb({ ok: true, code, playerId: socket.id, sessionId });
     broadcastLobby(rooms[code], code);
   });
 
@@ -128,11 +135,38 @@ io.on('connection', (socket) => {
     const room = rooms[code];
     if (!room) return cb({ ok: false, error: 'Partie introuvable' });
     if (room.status !== 'lobby') return cb({ ok: false, error: 'La partie a déjà commencé' });
-    room.players[socket.id] = { id: socket.id, name: name || 'Joueur', role: null, lat: null, lng: null, lastReveal: null, token: makeToken(), lastUpdate: null };
+    const sessionId = makeSessionId();
+    room.players[socket.id] = { id: socket.id, name: name || 'Joueur', role: null, lat: null, lng: null, lastReveal: null, token: makeToken(), sessionId, connected: true, disconnectTimer: null, lastUpdate: null };
     currentCode = code;
     socket.join(code);
-    cb({ ok: true, code, playerId: socket.id });
+    cb({ ok: true, code, playerId: socket.id, sessionId });
     broadcastLobby(room, code);
+  });
+
+  // Reconnexion apres un refresh / une coupure reseau : on retrouve le joueur
+  // via son sessionId (stocke cote client) et on reprend sa place exactement
+  // ou il en etait (role, position, token QR, jeu en cours ou lobby).
+  socket.on('rejoin_room', ({ code, sessionId }, cb) => {
+    code = (code || '').toUpperCase().trim();
+    const room = rooms[code];
+    if (!room) return cb({ ok: false, error: 'Partie introuvable' });
+    const oldId = Object.keys(room.players).find(id => room.players[id].sessionId === sessionId);
+    if (!oldId) return cb({ ok: false, error: 'Session introuvable' });
+
+    const player = room.players[oldId];
+    if (player.disconnectTimer) { clearTimeout(player.disconnectTimer); player.disconnectTimer = null; }
+    delete room.players[oldId];
+    player.id = socket.id;
+    player.connected = true;
+    room.players[socket.id] = player;
+    if (room.hostId === oldId) room.hostId = socket.id;
+
+    currentCode = code;
+    socket.join(code);
+    cb({ ok: true, code, playerId: socket.id, sessionId, status: room.status, isHost: room.hostId === socket.id });
+
+    if (room.status === 'lobby') broadcastLobby(room, code);
+    else broadcastGameViews(room, code);
   });
 
   // Seul l'hote peut assigner les roles
@@ -180,7 +214,7 @@ io.on('connection', (socket) => {
         broadcastGameViews(room, code);
         room.dirty = false;
       }
-    }, 2000);
+    }, 1500);
 
     room.revealTimer = setInterval(() => {
       Object.values(room.players).forEach(p => {
@@ -243,16 +277,25 @@ io.on('connection', (socket) => {
   function handleLeave(code, socket) {
     const room = rooms[code];
     if (!room) return;
-    delete room.players[socket.id];
-    if (Object.keys(room.players).length === 0) {
-      if (room.revealTimer) clearInterval(room.revealTimer);
-      if (room.broadcastTimer) clearInterval(room.broadcastTimer);
-      delete rooms[code];
-      return;
-    }
-    if (room.hostId === socket.id) room.hostId = Object.keys(room.players)[0];
-    if (room.status === 'lobby') broadcastLobby(room, code);
-    else broadcastGameViews(room, code);
+    const player = room.players[socket.id];
+    if (!player) return;
+
+    // on ne supprime pas tout de suite : on laisse une fenetre pour un refresh/reconnexion
+    player.connected = false;
+    player.disconnectTimer = setTimeout(() => {
+      const r = rooms[code];
+      if (!r) return;
+      delete r.players[socket.id];
+      if (Object.keys(r.players).length === 0) {
+        if (r.revealTimer) clearInterval(r.revealTimer);
+        if (r.broadcastTimer) clearInterval(r.broadcastTimer);
+        delete rooms[code];
+        return;
+      }
+      if (r.hostId === socket.id) r.hostId = Object.keys(r.players)[0];
+      if (r.status === 'lobby') broadcastLobby(r, code);
+      else broadcastGameViews(r, code);
+    }, DISCONNECT_GRACE_MS);
   }
 });
 
