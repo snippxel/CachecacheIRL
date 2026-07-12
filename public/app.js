@@ -1,4 +1,15 @@
 const socket = io();
+const SESSION_KEY = 'traque_session';
+
+function saveSession(code, sessionId, name) {
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify({ code, sessionId, name })); } catch (e) {}
+}
+function loadSession() {
+  try { return JSON.parse(localStorage.getItem(SESSION_KEY)); } catch (e) { return null; }
+}
+function clearSession() {
+  try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
+}
 
 let state = {
   code: null,
@@ -16,6 +27,22 @@ let state = {
   timerInterval: null,
   nextRevealAt: null
 };
+
+// Tentative de reconnexion automatique si on a deja une session en cours
+// (ex : la page vient d'etre rafraichie pendant une partie)
+socket.on('connect', () => {
+  const saved = loadSession();
+  if (!saved) return;
+  socket.emit('rejoin_room', { code: saved.code, sessionId: saved.sessionId }, (res) => {
+    if (!res.ok) { clearSession(); return; }
+    state.code = res.code;
+    state.playerId = res.playerId;
+    state.isHost = res.isHost;
+    if (res.status === 'lobby') enterLobby();
+    // si la partie est en cours, l'ecran "screen-game" s'ouvrira automatiquement
+    // via l'evenement 'game_view' que le serveur va renvoyer juste apres.
+  });
+});
 
 // ---------- Navigation ----------
 function showScreen(id) {
@@ -39,6 +66,7 @@ document.getElementById('btn-create').addEventListener('click', () => {
     state.code = res.code;
     state.playerId = res.playerId;
     state.isHost = true;
+    saveSession(res.code, res.sessionId, name);
     enterLobby();
   });
 });
@@ -53,6 +81,7 @@ document.getElementById('btn-join').addEventListener('click', () => {
     state.code = res.code;
     state.playerId = res.playerId;
     state.isHost = false;
+    saveSession(res.code, res.sessionId, name);
     enterLobby();
   });
 });
@@ -264,8 +293,8 @@ function roughDistanceMeters(lat1, lng1, lat2, lng2) {
 }
 
 const MAX_ACCEPTABLE_ACCURACY_M = 30; // au-dela, la mesure GPS est jugee trop bruitee
-const MIN_SEND_INTERVAL_MS = 2000; // n'envoie pas plus souvent que ca, meme si ca bouge
-const MIN_MOVE_METERS = 3; // ...sauf si on a vraiment bouge de plus de 3m
+const MIN_SEND_INTERVAL_MS = 1500; // n'envoie pas plus souvent que ca, meme si ca bouge
+const MIN_MOVE_METERS = 2; // ...sauf si on a vraiment bouge de plus de 2m
 
 function startGeolocation() {
   if (state.watchId) navigator.geolocation.clearWatch(state.watchId);
@@ -386,7 +415,10 @@ socket.on('game_over', ({ winner, reason }) => {
   showScreen('screen-over');
 });
 
-document.getElementById('btn-back-home').addEventListener('click', () => location.reload());
+document.getElementById('btn-back-home').addEventListener('click', () => {
+  clearSession();
+  location.reload();
+});
 
 // ---------- Utils ----------
 function escapeHtml(str) {
