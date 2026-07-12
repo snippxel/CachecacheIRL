@@ -49,13 +49,17 @@ function gameViewFor(room, code, viewerId) {
     const base = { id: p.id, name: p.name, role: p.role };
     if (p.id === viewerId) {
       // on se voit soi-meme en temps reel + on recoit son propre token pour afficher son QR
-      return { ...base, lat: p.lat, lng: p.lng, live: true, myToken: p.token };
+      return { ...base, lat: p.lat, lng: p.lng, accuracy: p.accuracy, live: true, myToken: p.token };
+    }
+    if (!isHunter) {
+      // un cache ne voit JAMAIS personne d'autre : ni les chasseurs, ni les autres caches
+      return { ...base, lat: null, lng: null, live: false };
     }
     if (p.role === 'hunter') {
-      // les chasseurs sont visibles en temps reel par tout le monde (pour pouvoir les fuir)
+      // les coequipiers chasseurs se voient entre eux en temps reel
       return { ...base, lat: p.lat, lng: p.lng, live: true };
     }
-    if (isHunter && p.lastReveal) {
+    if (p.lastReveal) {
       // cache : uniquement visible pour les chasseurs, via la derniere revelation (5 min)
       return { ...base, lat: p.lastReveal.lat, lng: p.lastReveal.lng, live: false, revealedAt: p.lastReveal.time };
     }
@@ -90,6 +94,7 @@ function checkWinCondition(room, code) {
   if (hidden.length === 0) {
     room.status = 'ended';
     if (room.revealTimer) clearInterval(room.revealTimer);
+    if (room.broadcastTimer) clearInterval(room.broadcastTimer);
     io.to(code).emit('game_over', { winner: 'hunters', reason: 'Tous les cachés ont été attrapés' });
   }
 }
@@ -104,6 +109,8 @@ io.on('connection', (socket) => {
       status: 'lobby',
       zone: null,
       revealTimer: null,
+      broadcastTimer: null,
+      dirty: false,
       nextRevealAt: null,
       players: {
         [socket.id]: { id: socket.id, name: name || 'Hôte', role: null, lat: null, lng: null, lastReveal: null, token: makeToken(), lastUpdate: null }
@@ -166,6 +173,15 @@ io.on('connection', (socket) => {
     broadcastGameViews(room, code);
     cb && cb({ ok: true });
 
+    // on ne diffuse l'etat qu'a intervalle regulier (pas a chaque update GPS individuel)
+    // pour eviter de saturer le reseau et faire ramer les telephones
+    room.broadcastTimer = setInterval(() => {
+      if (room.dirty) {
+        broadcastGameViews(room, code);
+        room.dirty = false;
+      }
+    }, 2000);
+
     room.revealTimer = setInterval(() => {
       Object.values(room.players).forEach(p => {
         if (p.role === 'hidden' && p.lat != null) {
@@ -182,20 +198,22 @@ io.on('connection', (socket) => {
       if (r && r.status === 'playing') {
         r.status = 'ended';
         if (r.revealTimer) clearInterval(r.revealTimer);
+        if (r.broadcastTimer) clearInterval(r.broadcastTimer);
         io.to(code).emit('game_over', { winner: 'hidden', reason: 'Le temps est écoulé, des joueurs cachés ont survécu' });
       }
     }, room.zone.durationMs);
   });
 
-  socket.on('update_position', ({ code, lat, lng }) => {
+  socket.on('update_position', ({ code, lat, lng, accuracy }) => {
     const room = rooms[code];
     if (!room) return;
     const player = room.players[socket.id];
     if (!player) return;
     player.lat = lat;
     player.lng = lng;
+    player.accuracy = accuracy;
     player.lastUpdate = Date.now();
-    if (room.status === 'playing') broadcastGameViews(room, code);
+    if (room.status === 'playing') room.dirty = true;
   });
 
   // Elimination par QR : le chasseur scanne le code affiche par le cache.
@@ -228,6 +246,7 @@ io.on('connection', (socket) => {
     delete room.players[socket.id];
     if (Object.keys(room.players).length === 0) {
       if (room.revealTimer) clearInterval(room.revealTimer);
+      if (room.broadcastTimer) clearInterval(room.broadcastTimer);
       delete rooms[code];
       return;
     }
