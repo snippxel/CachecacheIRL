@@ -149,6 +149,10 @@ document.getElementById('btn-manual-roles').addEventListener('click', () => {
   }
 });
 
+document.getElementById('cfg-safety-confirm').addEventListener('change', (e) => {
+  document.getElementById('btn-start-game').disabled = !e.target.checked;
+});
+
 document.getElementById('btn-start-game').addEventListener('click', () => {
   const radiusStart = parseInt(document.getElementById('cfg-radius-start').value, 10) || 400;
   const radiusEnd = parseInt(document.getElementById('cfg-radius-end').value, 10) || 40;
@@ -156,6 +160,7 @@ document.getElementById('btn-start-game').addEventListener('click', () => {
   const steps = parseInt(document.getElementById('cfg-steps').value, 10) || 4;
   const revealIntervalMinutes = parseFloat(document.getElementById('cfg-reveal-interval').value) || 5;
   const zoneGraceSeconds = parseInt(document.getElementById('cfg-zone-grace').value, 10) || 10;
+  const survivorMode = document.getElementById('cfg-survivor').checked;
 
   navigator.geolocation.getCurrentPosition((pos) => {
     socket.emit('start_game', {
@@ -169,7 +174,8 @@ document.getElementById('btn-start-game').addEventListener('click', () => {
       durationMinutes: duration,
       steps,
       revealIntervalMinutes,
-      zoneGraceSeconds
+      zoneGraceSeconds,
+      survivorMode
     }, (res) => {
       if (!res.ok) alert(res.error);
     });
@@ -181,6 +187,7 @@ socket.on('game_started', () => {
 });
 
 let gameEntered = false;
+let radarUsed = false;
 
 socket.on('game_view', (view) => {
   state.players = view.players;
@@ -209,6 +216,8 @@ function updateRoleUI() {
   document.getElementById('btn-scan').classList.toggle('hidden', state.myRole !== 'hunter');
 
   document.getElementById('reveal-timer').classList.remove('hidden');
+  document.getElementById('btn-radar').classList.toggle('hidden', state.myRole !== 'hunter' || radarUsed);
+  updateCompass();
 }
 
 function enterGame() {
@@ -216,6 +225,63 @@ function enterGame() {
   initMap();
   startGeolocation();
   startTimer();
+  requestWakeLock();
+  startCompass();
+}
+
+let wakeLock = null;
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+    }
+  } catch (e) { console.warn('Wake Lock indisponible', e); }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.status === 'playing') requestWakeLock();
+});
+
+let deviceHeading = null;
+
+function handleOrientation(e) {
+  if (typeof e.webkitCompassHeading === 'number') {
+    deviceHeading = e.webkitCompassHeading;
+  } else if (e.absolute && e.alpha != null) {
+    deviceHeading = 360 - e.alpha;
+  }
+}
+
+function startCompass() {
+  if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+    DeviceOrientationEvent.requestPermission().then(res => {
+      if (res === 'granted') window.addEventListener('deviceorientation', handleOrientation);
+    }).catch(() => {});
+  } else {
+    window.addEventListener('deviceorientationabsolute', handleOrientation, true);
+    window.addEventListener('deviceorientation', handleOrientation, true);
+  }
+}
+
+function bearingTo(lat1, lng1, lat2, lng2) {
+  const toRad = (d) => (d * Math.PI) / 180;
+  const toDeg = (r) => (r * 180) / Math.PI;
+  const dLng = toRad(lng2 - lng1);
+  const y = Math.sin(dLng) * Math.cos(toRad(lat2));
+  const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) - Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLng);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+
+let lastKnownPos = null;
+function updateCompass() {
+  const compassEl = document.getElementById('compass');
+  if (state.myRole !== 'hidden' || !lastKnownPos || !state.zone) {
+    compassEl.classList.add('hidden');
+    return;
+  }
+  compassEl.classList.remove('hidden');
+  const bearing = bearingTo(lastKnownPos[0], lastKnownPos[1], state.zone.centerLat, state.zone.centerLng);
+  const relative = deviceHeading != null ? (bearing - deviceHeading + 360) % 360 : bearing;
+  document.getElementById('compass-arrow').style.transform = `rotate(${relative}deg)`;
 }
 
 function initMap() {
@@ -338,6 +404,8 @@ function startGeolocation() {
 
 function renderMyOwnMarker(lat, lng) {
   if (!state.map) return;
+  lastKnownPos = [lat, lng];
+  updateCompass();
   const icon = L.divIcon({
     className: '',
     html: `<div class="player-marker me" style="background:#FF9F1C"></div><div class="marker-label">Toi</div>`,
@@ -440,6 +508,39 @@ function stopScanner() {
 
 socket.on('capture', ({ name }) => showToast(`${name} rejoint les chasseurs !`));
 
+document.getElementById('btn-radar').addEventListener('click', () => {
+  if (radarUsed) return;
+  socket.emit('use_radar', { code: state.code }, (res) => {
+    if (!res.ok) { showToast(res.error); return; }
+    radarUsed = true;
+    document.getElementById('btn-radar').classList.add('hidden');
+    showToast(`Radar : ${res.name} repéré !`);
+    if (!state.map) return;
+    const icon = L.divIcon({
+      className: '',
+      html: `<div class="hunter-ping-marker"></div><div class="marker-label">${escapeHtml(res.name)} (radar)</div>`,
+      iconSize: [22, 22], iconAnchor: [11, 11]
+    });
+    const marker = L.marker([res.lat, res.lng], { icon }).addTo(state.map);
+    setTimeout(() => state.map.removeLayer(marker), 8000);
+  });
+});
+
+document.querySelectorAll('.quick-chat .chip').forEach(btn => {
+  btn.addEventListener('click', () => {
+    socket.emit('team_message', { code: state.code, text: btn.dataset.msg });
+  });
+});
+
+socket.on('team_message', ({ name, text }) => {
+  const feed = document.getElementById('team-feed');
+  const item = document.createElement('div');
+  item.className = 'team-feed-item';
+  item.textContent = `${name} : ${text}`;
+  feed.appendChild(item);
+  setTimeout(() => item.remove(), 4000);
+});
+
 let audioCtx = null;
 document.addEventListener('pointerdown', () => {
   if (!audioCtx) {
@@ -501,11 +602,15 @@ socket.on('zone_warning', ({ deadline }) => {
   const countdownEl = document.getElementById('zone-warning-countdown');
   overlay.classList.remove('hidden');
   playAlarmBeep();
+  if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
   if (zoneWarningInterval) clearInterval(zoneWarningInterval);
   zoneWarningInterval = setInterval(() => {
     const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
     countdownEl.textContent = remaining;
-    if (remaining <= 0 || remaining % 2 === 0) playAlarmBeep();
+    if (remaining <= 0 || remaining % 2 === 0) {
+      playAlarmBeep();
+      if (navigator.vibrate) navigator.vibrate(150);
+    }
     if (Date.now() >= deadline) {
       clearInterval(zoneWarningInterval);
       zoneWarningInterval = null;
@@ -550,15 +655,40 @@ function showToast(msg) {
   showToast._t = setTimeout(() => toast.classList.add('hidden'), 2600);
 }
 
-socket.on('game_over', ({ winner, reason }) => {
+socket.on('game_over', ({ winner, reason, stats }) => {
   if (state.watchId) navigator.geolocation.clearWatch(state.watchId);
   if (state.timerInterval) clearInterval(state.timerInterval);
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
   document.getElementById('zone-warning-overlay').classList.add('hidden');
   if (zoneWarningInterval) { clearInterval(zoneWarningInterval); zoneWarningInterval = null; }
   document.getElementById('over-title').textContent = winner === 'hunters' ? 'Les chasseurs gagnent' : 'Les cachés gagnent';
   document.getElementById('over-reason').textContent = reason;
+  renderStats(stats);
   showScreen('screen-over');
 });
+
+function renderStats(stats) {
+  const el = document.getElementById('over-stats');
+  if (!stats || !stats.length) { el.innerHTML = ''; return; }
+  const fmtTime = (ms) => {
+    if (ms == null) return '—';
+    const s = Math.round(ms / 1000);
+    return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+  };
+  const rows = stats.map(s => `
+    <tr>
+      <td>${escapeHtml(s.name)}</td>
+      <td>${s.startRole === 'hunter' ? 'Chasseur' : 'Caché'}</td>
+      <td>${fmtTime(s.timeSurvivedMs)}</td>
+      <td>${s.distanceM} m</td>
+      <td>${s.capturesMade}</td>
+    </tr>`).join('');
+  el.innerHTML = `
+    <table>
+      <thead><tr><th>Joueur</th><th>Rôle initial</th><th>Temps survécu</th><th>Distance</th><th>Captures</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
 
 document.getElementById('btn-back-home').addEventListener('click', () => {
   clearSession();
