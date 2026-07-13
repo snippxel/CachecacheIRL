@@ -24,6 +24,7 @@ let state = {
   map: null,
   markers: {},
   zoneCircle: null,
+  nextZoneCircle: null,
   myMarker: null,
   timerInterval: null,
   nextRevealAt: null
@@ -92,8 +93,6 @@ function showHomeError(msg) {
 }
 
 // ---------- Lobby ----------
-// L'hôte voit les contrôles (rôles + lancement). Un joueur qui rejoint ne voit
-// QU'un écran d'attente : aucun bouton d'action ne lui est jamais envoyé.
 function enterLobby() {
   document.getElementById('lobby-code').textContent = state.code;
   document.getElementById('host-controls').classList.toggle('hidden', !state.isHost);
@@ -139,8 +138,6 @@ function buildManualPanel(room) {
   });
 }
 
-// Ces handlers ne sont branchés que sur les boutons de l'hôte, qui sont
-// physiquement absents (masqués) de l'écran d'un joueur invité.
 document.getElementById('btn-random-roles').addEventListener('click', () => {
   socket.emit('set_roles', { code: state.code, mode: 'random' }, () => {});
 });
@@ -163,6 +160,7 @@ document.getElementById('btn-start-game').addEventListener('click', () => {
   const radiusStart = parseInt(document.getElementById('cfg-radius-start').value, 10) || 400;
   const radiusEnd = parseInt(document.getElementById('cfg-radius-end').value, 10) || 40;
   const duration = parseInt(document.getElementById('cfg-duration').value, 10) || 20;
+  const steps = parseInt(document.getElementById('cfg-steps').value, 10) || 4;
 
   navigator.geolocation.getCurrentPosition((pos) => {
     socket.emit('start_game', {
@@ -173,7 +171,8 @@ document.getElementById('btn-start-game').addEventListener('click', () => {
         startRadius: radiusStart,
         endRadius: radiusEnd
       },
-      durationMinutes: duration
+      durationMinutes: duration,
+      steps
     }, (res) => {
       if (!res.ok) alert(res.error);
     });
@@ -210,7 +209,6 @@ function updateRoleUI() {
   badge.textContent = state.myRole === 'hunter' ? 'CHASSEUR' : 'CACHÉ';
   badge.className = 'role-badge ' + (state.myRole === 'hunter' ? 'role-hunter' : 'role-hidden');
 
-  // Seuls les cachés ont besoin de montrer leur QR. Seuls les chasseurs scannent.
   document.getElementById('btn-my-qr').classList.toggle('hidden', state.myRole !== 'hidden');
   document.getElementById('btn-scan').classList.toggle('hidden', state.myRole !== 'hunter');
 
@@ -237,21 +235,44 @@ function initMap() {
     color: '#FF9F1C', weight: 2, dashArray: '6 6', fillOpacity: 0.05
   }).addTo(state.map);
 
+  state.nextZoneCircle = L.circle([state.zone.centerLat, state.zone.centerLng], {
+    radius: state.zone.startRadius,
+    color: '#E63946', weight: 2, dashArray: '3 8', fillOpacity: 0
+  }).addTo(state.map);
+
   setTimeout(() => state.map.invalidateSize(), 200);
   updateZoneRadius();
   renderGamePlayers();
 }
 
+function currentPhaseIndex(zone, now) {
+  const idx = Math.floor((now - zone.startTime) / zone.phaseDurationMs);
+  return Math.min(zone.phases, Math.max(0, idx));
+}
+
 function currentZoneRadius() {
   const z = state.zone;
-  const elapsed = Date.now() - z.startTime;
-  const t = Math.min(1, Math.max(0, elapsed / z.durationMs));
-  return z.startRadius + (z.endRadius - z.startRadius) * t;
+  if (!z.radii) return z.startRadius;
+  return z.radii[currentPhaseIndex(z, Date.now())];
+}
+
+function nextZoneRadius() {
+  const z = state.zone;
+  if (!z.radii) return null;
+  const idx = currentPhaseIndex(z, Date.now());
+  return idx < z.phases ? z.radii[idx + 1] : null;
 }
 
 function updateZoneRadius() {
   if (!state.zoneCircle) return;
   state.zoneCircle.setRadius(currentZoneRadius());
+  const next = nextZoneRadius();
+  if (next != null) {
+    state.nextZoneCircle.setRadius(next);
+    state.nextZoneCircle.setStyle({ opacity: 1 });
+  } else {
+    state.nextZoneCircle.setStyle({ opacity: 0 });
+  }
 }
 
 function renderGamePlayers() {
@@ -369,6 +390,21 @@ function startTimer() {
       const rs = Math.floor((rem % 60000) / 1000);
       document.getElementById('reveal-countdown').textContent = `${String(rm).padStart(2, '0')}:${String(rs).padStart(2, '0')}`;
     }
+
+    if (state.zone && state.zone.phaseDurationMs) {
+      const idx = currentPhaseIndex(state.zone, Date.now());
+      const zoneTimerEl = document.getElementById('zone-timer');
+      if (idx < state.zone.phases) {
+        const nextChangeAt = state.zone.startTime + (idx + 1) * state.zone.phaseDurationMs;
+        const zrem = Math.max(0, nextChangeAt - Date.now());
+        const zm = Math.floor(zrem / 60000);
+        const zs = Math.floor((zrem % 60000) / 1000);
+        document.getElementById('zone-countdown').textContent = `${String(zm).padStart(2, '0')}:${String(zs).padStart(2, '0')}`;
+        zoneTimerEl.classList.remove('hidden');
+      } else {
+        zoneTimerEl.classList.add('hidden');
+      }
+    }
   }, 1000);
 }
 
@@ -408,6 +444,69 @@ function stopScanner() {
 
 socket.on('capture', ({ name }) => showToast(`${name} rejoint les chasseurs !`));
 
+let audioCtx = null;
+document.addEventListener('pointerdown', () => {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+  } else if (audioCtx.state === 'suspended') {
+    audioCtx.resume();
+  }
+}, { once: false });
+
+function playAlarmBeep() {
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'square';
+  osc.frequency.setValueAtTime(880, now);
+  gain.gain.setValueAtTime(0.2, now);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(now);
+  osc.stop(now + 0.35);
+}
+
+let zoneWarningInterval = null;
+
+socket.on('zone_warning', ({ deadline }) => {
+  const overlay = document.getElementById('zone-warning-overlay');
+  const countdownEl = document.getElementById('zone-warning-countdown');
+  overlay.classList.remove('hidden');
+  playAlarmBeep();
+  if (zoneWarningInterval) clearInterval(zoneWarningInterval);
+  zoneWarningInterval = setInterval(() => {
+    const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+    countdownEl.textContent = remaining;
+    if (remaining <= 0 || remaining % 2 === 0) playAlarmBeep();
+    if (Date.now() >= deadline) {
+      clearInterval(zoneWarningInterval);
+      zoneWarningInterval = null;
+    }
+  }, 1000);
+});
+
+socket.on('zone_safe', () => {
+  document.getElementById('zone-warning-overlay').classList.add('hidden');
+  if (zoneWarningInterval) { clearInterval(zoneWarningInterval); zoneWarningInterval = null; }
+});
+
+socket.on('zone_shrink', () => showToast('La zone vient de rétrécir !'));
+
+socket.on('zone_capture', ({ name }) => showToast(`${name} est resté hors zone trop longtemps et rejoint les chasseurs !`));
+
+socket.on('zone_exit_ping', ({ name, lat, lng }) => {
+  showToast(`${name} est sorti de la zone !`);
+  if (!state.map) return;
+  const icon = L.divIcon({
+    className: '',
+    html: `<div class="hunter-ping-marker"></div><div class="marker-label">${escapeHtml(name)}</div>`,
+    iconSize: [22, 22], iconAnchor: [11, 11]
+  });
+  const marker = L.marker([lat, lng], { icon }).addTo(state.map);
+  setTimeout(() => state.map.removeLayer(marker), 6000);
+});
+
 function showToast(msg) {
   const toast = document.getElementById('toast');
   toast.textContent = msg;
@@ -419,6 +518,8 @@ function showToast(msg) {
 socket.on('game_over', ({ winner, reason }) => {
   if (state.watchId) navigator.geolocation.clearWatch(state.watchId);
   if (state.timerInterval) clearInterval(state.timerInterval);
+  document.getElementById('zone-warning-overlay').classList.add('hidden');
+  if (zoneWarningInterval) { clearInterval(zoneWarningInterval); zoneWarningInterval = null; }
   document.getElementById('over-title').textContent = winner === 'hunters' ? 'Les chasseurs gagnent' : 'Les cachés gagnent';
   document.getElementById('over-reason').textContent = reason;
   showScreen('screen-over');
