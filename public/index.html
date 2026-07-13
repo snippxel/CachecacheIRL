@@ -64,8 +64,15 @@
       <label>Nombre de paliers <input id="cfg-steps" type="number" value="4" min="1" max="10" class="input input-sm"/></label>
       <label>Intervalle de révélation (min) <input id="cfg-reveal-interval" type="number" value="5" min="0.5" step="0.5" class="input input-sm"/></label>
       <label>Délai de grâce hors-zone (s) <input id="cfg-zone-grace" type="number" value="10" min="3" max="120" class="input input-sm"/></label>
+      <label>Mode dernier survivant (pas de limite de temps) <input id="cfg-survivor" type="checkbox"/></label>
     </div>
-    <button id="btn-start-game" class="btn btn-primary">Lancer la partie</button>
+
+    <div class="safety-reminder">
+      ⚠️ Vérifie que la zone choisie n'inclut pas de routes passantes, plans d'eau ou zones dangereuses avant de lancer.
+      <label class="safety-check"><input type="checkbox" id="cfg-safety-confirm"/> J'ai vérifié que la zone est sûre</label>
+    </div>
+
+    <button id="btn-start-game" class="btn btn-primary" disabled>Lancer la partie</button>
   </div>
 
   <!-- Visible uniquement pour les non-hôtes : aucune action possible, juste l'attente -->
@@ -91,9 +98,25 @@
   <div id="toast" class="toast hidden"></div>
   <div id="accuracy-badge" class="accuracy-badge hidden"></div>
 
+  <!-- Boussole vers le centre de la zone : visible uniquement pour les cachés -->
+  <div id="compass" class="compass hidden">
+    <div id="compass-arrow" class="compass-arrow">➤</div>
+  </div>
+
+  <!-- Chat rapide : messages pre-ecrits visibles par sa propre equipe uniquement -->
+  <div id="team-feed" class="team-feed"></div>
+  <div class="quick-chat">
+    <button class="chip" data-msg="À l'aide !">À l'aide !</button>
+    <button class="chip" data-msg="Je suis coincé">Coincé</button>
+    <button class="chip" data-msg="RAS">RAS</button>
+    <button class="chip" data-msg="Par ici !">Par ici !</button>
+  </div>
+
   <div class="hud-bottom">
     <!-- Bouton "Mon code" : uniquement pour les joueurs CACHÉS, ça ne sert à rien pour un chasseur -->
     <button id="btn-my-qr" class="fab fab-secondary hidden">Mon code</button>
+    <!-- Bouton Radar : uniquement pour les CHASSEURS, une seule utilisation par partie -->
+    <button id="btn-radar" class="fab fab-secondary hidden">Radar (1)</button>
     <!-- Bouton "Éliminer" : uniquement pour les CHASSEURS -->
     <button id="btn-scan" class="fab fab-primary hidden">Éliminer</button>
   </div>
@@ -114,6 +137,7 @@
   <div class="card center-card">
     <h2 id="over-title" class="over-title">Partie terminée</h2>
     <p id="over-reason" class="over-reason"></p>
+    <div id="over-stats" class="over-stats"></div>
     <button id="btn-back-home" class="btn btn-primary">Retour à l'accueil</button>
   </div>
 </section>
