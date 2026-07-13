@@ -61,6 +61,7 @@
       <label>Rayon de départ (m) <input id="cfg-radius-start" type="number" value="400" class="input input-sm"/></label>
       <label>Rayon final (m) <input id="cfg-radius-end" type="number" value="40" class="input input-sm"/></label>
       <label>Durée (minutes) <input id="cfg-duration" type="number" value="20" class="input input-sm"/></label>
+      <label>Nombre de paliers <input id="cfg-steps" type="number" value="4" min="1" max="10" class="input input-sm"/></label>
     </div>
     <button id="btn-start-game" class="btn btn-primary">Lancer la partie</button>
   </div>
@@ -81,6 +82,7 @@
     <div class="hud-top-right">
       <div id="timer" class="timer">--:--</div>
       <div id="reveal-timer" class="reveal-timer hidden">Signal caché dans <span id="reveal-countdown">--:--</span></div>
+      <div id="zone-timer" class="reveal-timer hidden">Prochain rétrécissement dans <span id="zone-countdown">--:--</span></div>
     </div>
   </div>
 
@@ -94,6 +96,16 @@
     <button id="btn-scan" class="fab fab-primary hidden">Éliminer</button>
   </div>
 </section>
+
+<!-- ===== ALERTE HORS-ZONE (plein ecran, cachés uniquement) ===== -->
+<div id="zone-warning-overlay" class="zone-warning-overlay hidden">
+  <div class="zone-warning-content">
+    <div class="zone-warning-icon">⚠</div>
+    <h2>HORS ZONE</h2>
+    <p>Reviens dans la zone sûre !</p>
+    <div id="zone-warning-countdown" class="zone-warning-countdown">10</div>
+  </div>
+</div>
 
 <!-- ===== ECRAN FIN ===== -->
 <section id="screen-over" class="screen">
