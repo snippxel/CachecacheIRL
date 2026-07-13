@@ -30,8 +30,6 @@ let state = {
   nextRevealAt: null
 };
 
-// Tentative de reconnexion automatique si on a deja une session en cours
-// (ex : la page vient d'etre rafraichie pendant une partie)
 socket.on('connect', () => {
   const saved = loadSession();
   if (!saved) return;
@@ -41,12 +39,9 @@ socket.on('connect', () => {
     state.playerId = res.playerId;
     state.isHost = res.isHost;
     if (res.status === 'lobby') enterLobby();
-    // si la partie est en cours, l'ecran "screen-game" s'ouvrira automatiquement
-    // via l'evenement 'game_view' que le serveur va renvoyer juste apres.
   });
 });
 
-// ---------- Navigation ----------
 function showScreen(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
@@ -59,7 +54,6 @@ document.querySelectorAll('[data-close]').forEach(btn => {
   });
 });
 
-// ---------- Accueil ----------
 document.getElementById('btn-create').addEventListener('click', () => {
   const name = document.getElementById('input-name').value.trim();
   if (!name) return showHomeError('Entre ton nom d\'abord.');
@@ -92,7 +86,6 @@ function showHomeError(msg) {
   document.getElementById('home-error').textContent = msg;
 }
 
-// ---------- Lobby ----------
 function enterLobby() {
   document.getElementById('lobby-code').textContent = state.code;
   document.getElementById('host-controls').classList.toggle('hidden', !state.isHost);
@@ -161,6 +154,8 @@ document.getElementById('btn-start-game').addEventListener('click', () => {
   const radiusEnd = parseInt(document.getElementById('cfg-radius-end').value, 10) || 40;
   const duration = parseInt(document.getElementById('cfg-duration').value, 10) || 20;
   const steps = parseInt(document.getElementById('cfg-steps').value, 10) || 4;
+  const revealIntervalMinutes = parseFloat(document.getElementById('cfg-reveal-interval').value) || 5;
+  const zoneGraceSeconds = parseInt(document.getElementById('cfg-zone-grace').value, 10) || 10;
 
   navigator.geolocation.getCurrentPosition((pos) => {
     socket.emit('start_game', {
@@ -172,14 +167,15 @@ document.getElementById('btn-start-game').addEventListener('click', () => {
         endRadius: radiusEnd
       },
       durationMinutes: duration,
-      steps
+      steps,
+      revealIntervalMinutes,
+      zoneGraceSeconds
     }, (res) => {
       if (!res.ok) alert(res.error);
     });
   }, () => alert('Active la géolocalisation pour définir le centre de la zone.'), { enableHighAccuracy: true });
 });
 
-// ---------- Jeu ----------
 socket.on('game_started', () => {
   state.status = 'playing';
 });
@@ -467,6 +463,37 @@ function playAlarmBeep() {
   osc.stop(now + 0.35);
 }
 
+function playExitPingSound() {
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'triangle';
+  osc.frequency.setValueAtTime(1100, now);
+  osc.frequency.exponentialRampToValueAtTime(500, now + 0.25);
+  gain.gain.setValueAtTime(0.22, now);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(now);
+  osc.stop(now + 0.3);
+}
+
+function playRevealSound() {
+  if (!audioCtx) return;
+  [520, 780].forEach((freq, i) => {
+    const start = audioCtx.currentTime + i * 0.14;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq, start);
+    gain.gain.setValueAtTime(0.2, start);
+    gain.gain.exponentialRampToValueAtTime(0.001, start + 0.28);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(start);
+    osc.stop(start + 0.28);
+  });
+}
+
 let zoneWarningInterval = null;
 
 socket.on('zone_warning', ({ deadline }) => {
@@ -496,6 +523,7 @@ socket.on('zone_shrink', () => showToast('La zone vient de rétrécir !'));
 socket.on('zone_capture', ({ name }) => showToast(`${name} est resté hors zone trop longtemps et rejoint les chasseurs !`));
 
 socket.on('zone_exit_ping', ({ name, lat, lng }) => {
+  playExitPingSound();
   showToast(`${name} est sorti de la zone !`);
   if (!state.map) return;
   const icon = L.divIcon({
@@ -505,6 +533,13 @@ socket.on('zone_exit_ping', ({ name, lat, lng }) => {
   });
   const marker = L.marker([lat, lng], { icon }).addTo(state.map);
   setTimeout(() => state.map.removeLayer(marker), 6000);
+});
+
+socket.on('reveal_ping', () => {
+  if (state.myRole === 'hunter') {
+    playRevealSound();
+    showToast('Nouveau signal des cachés reçu !');
+  }
 });
 
 function showToast(msg) {
