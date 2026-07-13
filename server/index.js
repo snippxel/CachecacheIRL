@@ -10,8 +10,9 @@ const io = new Server(server, { cors: { origin: '*' } });
 
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-// ---- Reglages ----
-const REVEAL_INTERVAL_MS = 5 * 60 * 1000; // position des cachés révélée toutes les 5 min aux chasseurs
+// ---- Reglages par defaut (surchargeables par l'hote au lancement) ----
+const DEFAULT_REVEAL_INTERVAL_MS = 5 * 60 * 1000;
+const DEFAULT_ZONE_GRACE_MS = 10 * 1000;
 
 // ---- Etat en memoire ----
 const rooms = {};
@@ -88,7 +89,7 @@ function gameViewFor(room, code, viewerId) {
     hostId: room.hostId,
     zone: room.zone,
     nextRevealAt: room.nextRevealAt,
-    revealIntervalMs: REVEAL_INTERVAL_MS,
+    revealIntervalMs: room.revealIntervalMs,
     myRole: viewer ? viewer.role : null,
     players
   };
@@ -114,10 +115,8 @@ function currentSafeRadius(zone, now) {
   return zone.radii[currentPhaseIndex(zone, now)];
 }
 
-const ZONE_GRACE_MS = 10 * 1000; // temps pour revenir en zone sure avant de devenir chasseur
-
 // Verifie en continu si des caches sont hors-zone ; gere l'alerte, le delai de
-// grace de 10s, et la conversion automatique en chasseur si le delai expire.
+// grace configurable, et la conversion automatique en chasseur si le delai expire.
 function checkZoneBounds(room, code) {
   if (room.status !== 'playing' || !room.zone) return;
   const now = Date.now();
@@ -138,9 +137,9 @@ function checkZoneBounds(room, code) {
     if (dist > safeRadius) {
       if (!p.outOfZoneSince) {
         p.outOfZoneSince = now;
-        io.to(p.id).emit('zone_warning', { deadline: now + ZONE_GRACE_MS });
+        io.to(p.id).emit('zone_warning', { deadline: now + room.zoneGraceMs });
         broadcastToHunters(room, code, 'zone_exit_ping', { name: p.name, lat: p.lat, lng: p.lng });
-      } else if (now - p.outOfZoneSince >= ZONE_GRACE_MS) {
+      } else if (now - p.outOfZoneSince >= room.zoneGraceMs) {
         p.role = 'hunter';
         p.outOfZoneSince = null;
         p.lastReveal = null;
@@ -254,11 +253,14 @@ io.on('connection', (socket) => {
   });
 
   // Seul l'hote peut lancer la partie
-  socket.on('start_game', ({ code, zone, durationMinutes, steps }, cb) => {
+  socket.on('start_game', ({ code, zone, durationMinutes, steps, revealIntervalMinutes, zoneGraceSeconds }, cb) => {
     const room = rooms[code];
     if (!room || room.hostId !== socket.id) return cb && cb({ ok: false, error: 'Non autorisé : seul l’hôte peut lancer la partie' });
     const missingRole = Object.values(room.players).some(p => !p.role);
     if (missingRole) return cb && cb({ ok: false, error: 'Tous les joueurs doivent avoir un rôle' });
+
+    room.revealIntervalMs = revealIntervalMinutes ? Math.max(30 * 1000, revealIntervalMinutes * 60 * 1000) : DEFAULT_REVEAL_INTERVAL_MS;
+    room.zoneGraceMs = zoneGraceSeconds ? Math.max(3, Math.min(120, zoneGraceSeconds)) * 1000 : DEFAULT_ZONE_GRACE_MS;
 
     const phases = Math.max(1, Math.min(10, parseInt(steps, 10) || 4));
     const durationMs = durationMinutes * 60 * 1000;
@@ -280,7 +282,7 @@ io.on('connection', (socket) => {
       phaseDurationMs: durationMs / phases,
       lastPhaseIndex: 0
     };
-    room.nextRevealAt = Date.now() + REVEAL_INTERVAL_MS;
+    room.nextRevealAt = Date.now() + room.revealIntervalMs;
 
     io.to(code).emit('game_started');
     broadcastGameViews(room, code);
@@ -304,10 +306,10 @@ io.on('connection', (socket) => {
           p.lastReveal = { lat: p.lat, lng: p.lng, time: Date.now() };
         }
       });
-      room.nextRevealAt = Date.now() + REVEAL_INTERVAL_MS;
+      room.nextRevealAt = Date.now() + room.revealIntervalMs;
       io.to(code).emit('reveal_ping');
       broadcastGameViews(room, code);
-    }, REVEAL_INTERVAL_MS);
+    }, room.revealIntervalMs);
 
     setTimeout(() => {
       const r = rooms[code];
