@@ -143,6 +143,7 @@ function checkZoneBounds(room, code) {
         p.role = 'hunter';
         p.outOfZoneSince = null;
         p.lastReveal = null;
+        p.caughtAt = now;
         io.to(code).emit('zone_capture', { name: p.name });
         broadcastGameViews(room, code);
         checkWinCondition(room, code);
@@ -160,15 +161,31 @@ function broadcastGameViews(room, code) {
   });
 }
 
+function buildStats(room) {
+  const now = Date.now();
+  return Object.values(room.players).map(p => ({
+    name: p.name,
+    startRole: p.startRole,
+    finalRole: p.role,
+    timeSurvivedMs: p.startRole === 'hidden' ? (p.caughtAt ? p.caughtAt - room.zone.startTime : now - room.zone.startTime) : null,
+    distanceM: Math.round(p.distanceTraveled || 0),
+    capturesMade: p.capturesMade || 0
+  }));
+}
+
+function endGame(room, code, winner, reason) {
+  room.status = 'ended';
+  if (room.revealTimer) clearInterval(room.revealTimer);
+  if (room.broadcastTimer) clearInterval(room.broadcastTimer);
+  if (room.zoneCheckTimer) clearInterval(room.zoneCheckTimer);
+  io.to(code).emit('game_over', { winner, reason, stats: buildStats(room) });
+}
+
 function checkWinCondition(room, code) {
   if (room.status !== 'playing') return;
   const hidden = Object.values(room.players).filter(p => p.role === 'hidden');
   if (hidden.length === 0) {
-    room.status = 'ended';
-    if (room.revealTimer) clearInterval(room.revealTimer);
-    if (room.broadcastTimer) clearInterval(room.broadcastTimer);
-    if (room.zoneCheckTimer) clearInterval(room.zoneCheckTimer);
-    io.to(code).emit('game_over', { winner: 'hunters', reason: 'Tous les cachés ont été attrapés' });
+    endGame(room, code, 'hunters', 'Tous les cachés ont été attrapés');
   }
 }
 
@@ -187,7 +204,7 @@ io.on('connection', (socket) => {
       dirty: false,
       nextRevealAt: null,
       players: {
-        [socket.id]: { id: socket.id, name: name || 'Hôte', role: null, lat: null, lng: null, lastReveal: null, token: makeToken(), sessionId, connected: true, disconnectTimer: null, outOfZoneSince: null, lastUpdate: null }
+        [socket.id]: { id: socket.id, name: name || 'Hôte', role: null, lat: null, lng: null, lastReveal: null, token: makeToken(), sessionId, connected: true, disconnectTimer: null, outOfZoneSince: null, distanceTraveled: 0, capturesMade: 0, radarUsed: false, startRole: null, caughtAt: null, lastUpdate: null }
       },
       createdAt: Date.now()
     };
@@ -203,7 +220,7 @@ io.on('connection', (socket) => {
     if (!room) return cb({ ok: false, error: 'Partie introuvable' });
     if (room.status !== 'lobby') return cb({ ok: false, error: 'La partie a déjà commencé' });
     const sessionId = makeSessionId();
-    room.players[socket.id] = { id: socket.id, name: name || 'Joueur', role: null, lat: null, lng: null, lastReveal: null, token: makeToken(), sessionId, connected: true, disconnectTimer: null, outOfZoneSince: null, lastUpdate: null };
+    room.players[socket.id] = { id: socket.id, name: name || 'Joueur', role: null, lat: null, lng: null, lastReveal: null, token: makeToken(), sessionId, connected: true, disconnectTimer: null, outOfZoneSince: null, distanceTraveled: 0, capturesMade: 0, radarUsed: false, startRole: null, caughtAt: null, lastUpdate: null };
     currentCode = code;
     socket.join(code);
     cb({ ok: true, code, playerId: socket.id, sessionId });
@@ -253,7 +270,7 @@ io.on('connection', (socket) => {
   });
 
   // Seul l'hote peut lancer la partie
-  socket.on('start_game', ({ code, zone, durationMinutes, steps, revealIntervalMinutes, zoneGraceSeconds }, cb) => {
+  socket.on('start_game', ({ code, zone, durationMinutes, steps, revealIntervalMinutes, zoneGraceSeconds, survivorMode }, cb) => {
     const room = rooms[code];
     if (!room || room.hostId !== socket.id) return cb && cb({ ok: false, error: 'Non autorisé : seul l’hôte peut lancer la partie' });
     const missingRole = Object.values(room.players).some(p => !p.role);
@@ -261,6 +278,15 @@ io.on('connection', (socket) => {
 
     room.revealIntervalMs = revealIntervalMinutes ? Math.max(30 * 1000, revealIntervalMinutes * 60 * 1000) : DEFAULT_REVEAL_INTERVAL_MS;
     room.zoneGraceMs = zoneGraceSeconds ? Math.max(3, Math.min(120, zoneGraceSeconds)) * 1000 : DEFAULT_ZONE_GRACE_MS;
+    room.survivorMode = !!survivorMode;
+
+    Object.values(room.players).forEach(p => {
+      p.startRole = p.role;
+      p.distanceTraveled = 0;
+      p.capturesMade = 0;
+      p.radarUsed = false;
+      p.caughtAt = null;
+    });
 
     const phases = Math.max(1, Math.min(10, parseInt(steps, 10) || 4));
     const durationMs = durationMinutes * 60 * 1000;
@@ -311,16 +337,16 @@ io.on('connection', (socket) => {
       broadcastGameViews(room, code);
     }, room.revealIntervalMs);
 
-    setTimeout(() => {
-      const r = rooms[code];
-      if (r && r.status === 'playing') {
-        r.status = 'ended';
-        if (r.revealTimer) clearInterval(r.revealTimer);
-        if (r.broadcastTimer) clearInterval(r.broadcastTimer);
-        if (r.zoneCheckTimer) clearInterval(r.zoneCheckTimer);
-        io.to(code).emit('game_over', { winner: 'hidden', reason: 'Le temps est écoulé, des joueurs cachés ont survécu' });
-      }
-    }, room.zone.durationMs);
+    // en mode "dernier survivant", pas de fin de partie programmee par le temps :
+    // ca continue jusqu'a ce que tous les caches soient attrapes.
+    if (!room.survivorMode) {
+      setTimeout(() => {
+        const r = rooms[code];
+        if (r && r.status === 'playing') {
+          endGame(r, code, 'hidden', 'Le temps est écoulé, des joueurs cachés ont survécu');
+        }
+      }, room.zone.durationMs);
+    }
   });
 
   socket.on('update_position', ({ code, lat, lng, accuracy }) => {
@@ -328,6 +354,9 @@ io.on('connection', (socket) => {
     if (!room) return;
     const player = room.players[socket.id];
     if (!player) return;
+    if (player.lat != null && room.status === 'playing') {
+      player.distanceTraveled = (player.distanceTraveled || 0) + distanceMeters(player.lat, player.lng, lat, lng);
+    }
     player.lat = lat;
     player.lng = lng;
     player.accuracy = accuracy;
@@ -351,10 +380,42 @@ io.on('connection', (socket) => {
     target.role = 'hunter';
     target.lastReveal = null;
     target.outOfZoneSince = null;
+    target.caughtAt = Date.now();
+    scanner.capturesMade = (scanner.capturesMade || 0) + 1;
     broadcastGameViews(room, code);
     io.to(code).emit('capture', { name: target.name });
     cb && cb({ ok: true, name: target.name });
     checkWinCondition(room, code);
+  });
+
+  // Radar ponctuel : un chasseur peut reveler UNE FOIS la position exacte
+  // d'un cache choisi au hasard parmi ceux dont la position est connue.
+  socket.on('use_radar', ({ code }, cb) => {
+    const room = rooms[code];
+    if (!room) return cb && cb({ ok: false, error: 'Partie introuvable' });
+    const player = room.players[socket.id];
+    if (!player || player.role !== 'hunter') return cb && cb({ ok: false, error: 'Seul un chasseur peut utiliser le radar' });
+    if (player.radarUsed) return cb && cb({ ok: false, error: 'Radar déjà utilisé' });
+
+    const candidates = Object.values(room.players).filter(p => p.role === 'hidden' && p.lat != null);
+    if (candidates.length === 0) return cb && cb({ ok: false, error: 'Aucun signal disponible pour le moment' });
+
+    player.radarUsed = true;
+    const target = candidates[Math.floor(Math.random() * candidates.length)];
+    cb && cb({ ok: true, name: target.name, lat: target.lat, lng: target.lng });
+  });
+
+  // Message rapide, visible uniquement par les membres de la meme equipe
+  // (chasseurs entre eux, ou caches entre eux). Liste fermee anti-abus.
+  const ALLOWED_QUICK_MESSAGES = ["À l'aide !", 'Je suis coincé', 'RAS', 'Par ici !'];
+  socket.on('team_message', ({ code, text }) => {
+    const room = rooms[code];
+    if (!room || room.status !== 'playing') return;
+    const sender = room.players[socket.id];
+    if (!sender || !ALLOWED_QUICK_MESSAGES.includes(text)) return;
+    Object.values(room.players).forEach(p => {
+      if (p.role === sender.role) io.to(p.id).emit('team_message', { name: sender.name, text });
+    });
   });
 
   socket.on('leave_room', ({ code }) => handleLeave(code, socket));
