@@ -33,6 +33,16 @@ function makeSessionId() {
   return crypto.randomBytes(16).toString('hex');
 }
 
+// distance en metres entre deux points GPS (haversine)
+function distanceMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
 const DISCONNECT_GRACE_MS = 90 * 1000; // temps laisse a un joueur pour revenir apres un refresh/coupure
 
 // Vue "lobby" : liste simple, pas de position
@@ -88,6 +98,63 @@ function broadcastLobby(room, code) {
   io.to(code).emit('room_update', lobbySnapshot(room, code));
 }
 
+function broadcastToHunters(room, code, event, payload) {
+  Object.values(room.players).forEach(p => {
+    if (p.role === 'hunter') io.to(p.id).emit(event, payload);
+  });
+}
+
+// index du palier actuel (0 = zone de depart, jusqu'a zone.phases = zone finale)
+function currentPhaseIndex(zone, now) {
+  const idx = Math.floor((now - zone.startTime) / zone.phaseDurationMs);
+  return Math.min(zone.phases, Math.max(0, idx));
+}
+
+function currentSafeRadius(zone, now) {
+  return zone.radii[currentPhaseIndex(zone, now)];
+}
+
+const ZONE_GRACE_MS = 10 * 1000; // temps pour revenir en zone sure avant de devenir chasseur
+
+// Verifie en continu si des caches sont hors-zone ; gere l'alerte, le delai de
+// grace de 10s, et la conversion automatique en chasseur si le delai expire.
+function checkZoneBounds(room, code) {
+  if (room.status !== 'playing' || !room.zone) return;
+  const now = Date.now();
+  const zone = room.zone;
+
+  const phaseIdx = currentPhaseIndex(zone, now);
+  if (phaseIdx > zone.lastPhaseIndex) {
+    zone.lastPhaseIndex = phaseIdx;
+    io.to(code).emit('zone_shrink');
+  }
+
+  const safeRadius = currentSafeRadius(zone, now);
+
+  Object.values(room.players).forEach(p => {
+    if (p.role !== 'hidden' || p.lat == null) return;
+    const dist = distanceMeters(p.lat, p.lng, zone.centerLat, zone.centerLng);
+
+    if (dist > safeRadius) {
+      if (!p.outOfZoneSince) {
+        p.outOfZoneSince = now;
+        io.to(p.id).emit('zone_warning', { deadline: now + ZONE_GRACE_MS });
+        broadcastToHunters(room, code, 'zone_exit_ping', { name: p.name, lat: p.lat, lng: p.lng });
+      } else if (now - p.outOfZoneSince >= ZONE_GRACE_MS) {
+        p.role = 'hunter';
+        p.outOfZoneSince = null;
+        p.lastReveal = null;
+        io.to(code).emit('zone_capture', { name: p.name });
+        broadcastGameViews(room, code);
+        checkWinCondition(room, code);
+      }
+    } else if (p.outOfZoneSince) {
+      p.outOfZoneSince = null;
+      io.to(p.id).emit('zone_safe');
+    }
+  });
+}
+
 function broadcastGameViews(room, code) {
   Object.keys(room.players).forEach(pid => {
     io.to(pid).emit('game_view', gameViewFor(room, code, pid));
@@ -101,6 +168,7 @@ function checkWinCondition(room, code) {
     room.status = 'ended';
     if (room.revealTimer) clearInterval(room.revealTimer);
     if (room.broadcastTimer) clearInterval(room.broadcastTimer);
+    if (room.zoneCheckTimer) clearInterval(room.zoneCheckTimer);
     io.to(code).emit('game_over', { winner: 'hunters', reason: 'Tous les cachés ont été attrapés' });
   }
 }
@@ -120,7 +188,7 @@ io.on('connection', (socket) => {
       dirty: false,
       nextRevealAt: null,
       players: {
-        [socket.id]: { id: socket.id, name: name || 'Hôte', role: null, lat: null, lng: null, lastReveal: null, token: makeToken(), sessionId, connected: true, disconnectTimer: null, lastUpdate: null }
+        [socket.id]: { id: socket.id, name: name || 'Hôte', role: null, lat: null, lng: null, lastReveal: null, token: makeToken(), sessionId, connected: true, disconnectTimer: null, outOfZoneSince: null, lastUpdate: null }
       },
       createdAt: Date.now()
     };
@@ -136,7 +204,7 @@ io.on('connection', (socket) => {
     if (!room) return cb({ ok: false, error: 'Partie introuvable' });
     if (room.status !== 'lobby') return cb({ ok: false, error: 'La partie a déjà commencé' });
     const sessionId = makeSessionId();
-    room.players[socket.id] = { id: socket.id, name: name || 'Joueur', role: null, lat: null, lng: null, lastReveal: null, token: makeToken(), sessionId, connected: true, disconnectTimer: null, lastUpdate: null };
+    room.players[socket.id] = { id: socket.id, name: name || 'Joueur', role: null, lat: null, lng: null, lastReveal: null, token: makeToken(), sessionId, connected: true, disconnectTimer: null, outOfZoneSince: null, lastUpdate: null };
     currentCode = code;
     socket.join(code);
     cb({ ok: true, code, playerId: socket.id, sessionId });
@@ -186,11 +254,18 @@ io.on('connection', (socket) => {
   });
 
   // Seul l'hote peut lancer la partie
-  socket.on('start_game', ({ code, zone, durationMinutes }, cb) => {
+  socket.on('start_game', ({ code, zone, durationMinutes, steps }, cb) => {
     const room = rooms[code];
     if (!room || room.hostId !== socket.id) return cb && cb({ ok: false, error: 'Non autorisé : seul l’hôte peut lancer la partie' });
     const missingRole = Object.values(room.players).some(p => !p.role);
     if (missingRole) return cb && cb({ ok: false, error: 'Tous les joueurs doivent avoir un rôle' });
+
+    const phases = Math.max(1, Math.min(10, parseInt(steps, 10) || 4));
+    const durationMs = durationMinutes * 60 * 1000;
+    const radii = [];
+    for (let i = 0; i <= phases; i++) {
+      radii.push(zone.startRadius + (zone.endRadius - zone.startRadius) * (i / phases));
+    }
 
     room.status = 'playing';
     room.zone = {
@@ -199,7 +274,11 @@ io.on('connection', (socket) => {
       startRadius: zone.startRadius,
       endRadius: zone.endRadius,
       startTime: Date.now(),
-      durationMs: durationMinutes * 60 * 1000
+      durationMs,
+      phases,
+      radii,
+      phaseDurationMs: durationMs / phases,
+      lastPhaseIndex: 0
     };
     room.nextRevealAt = Date.now() + REVEAL_INTERVAL_MS;
 
@@ -215,6 +294,9 @@ io.on('connection', (socket) => {
         room.dirty = false;
       }
     }, 1500);
+
+    // verification des limites de zone (alerte + delai de grace + conversion)
+    room.zoneCheckTimer = setInterval(() => checkZoneBounds(room, code), 1000);
 
     room.revealTimer = setInterval(() => {
       Object.values(room.players).forEach(p => {
@@ -233,6 +315,7 @@ io.on('connection', (socket) => {
         r.status = 'ended';
         if (r.revealTimer) clearInterval(r.revealTimer);
         if (r.broadcastTimer) clearInterval(r.broadcastTimer);
+        if (r.zoneCheckTimer) clearInterval(r.zoneCheckTimer);
         io.to(code).emit('game_over', { winner: 'hidden', reason: 'Le temps est écoulé, des joueurs cachés ont survécu' });
       }
     }, room.zone.durationMs);
@@ -265,6 +348,7 @@ io.on('connection', (socket) => {
 
     target.role = 'hunter';
     target.lastReveal = null;
+    target.outOfZoneSince = null;
     broadcastGameViews(room, code);
     io.to(code).emit('capture', { name: target.name });
     cb && cb({ ok: true, name: target.name });
@@ -289,6 +373,7 @@ io.on('connection', (socket) => {
       if (Object.keys(r.players).length === 0) {
         if (r.revealTimer) clearInterval(r.revealTimer);
         if (r.broadcastTimer) clearInterval(r.broadcastTimer);
+        if (r.zoneCheckTimer) clearInterval(r.zoneCheckTimer);
         delete rooms[code];
         return;
       }
